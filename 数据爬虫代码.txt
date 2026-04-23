@@ -1,0 +1,204 @@
+﻿import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.logging.*;
+import com.fasterxml.jackson.databind.*;
+
+/**
+ * CityTrafficCollector
+ * 爬取高德地图交通态势 API（道路+矩形区域），抓取城市主要道路的实时车速与拥堵指数。
+ * 包含配置、任务调度、数据保存、日志、异常处理等复杂功能。
+ */
+public class CityTrafficCollector {
+
+    // ----------- 配置区 -----------
+    private static final String API_KEY = "your_gaode_api_key"; // 需替换为真实 Key
+    private static final String ROAD_URL = "https://restapi.amap.com/v3/traffic/status/road";
+    private static final String RECTANGLE_URL = "https://restapi.amap.com/v3/traffic/status/rectangle";
+    private static final int THREAD_POOL_SIZE = 5;
+    private static final Logger logger = Logger.getLogger("TrafficLogger");
+    private static final ObjectMapper mapper = new ObjectMapper();
+    private static final Path OUTPUT_DIR = Paths.get("output");
+
+    // ----------- 主函数 -----------
+    public static void main(String[] args) {
+        configureLogger();
+        try {
+            Files.createDirectories(OUTPUT_DIR);
+        } catch (IOException e) {
+            logger.severe("创建输出目录: " + e.getMessage());
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
+        List<Callable<Void>> tasks = new ArrayList<>();
+
+        // 任务：三个目标道路（按需替换为目标城市的道路名）
+        String[] roads = {"示例路1", "示例路2", "示例路3"};
+        for (String road : roads) {
+            tasks.add(new RoadTask(road, "目标城市"));
+        }
+
+        // 任务：矩形区域（按需替换为目标区域经纬度范围）
+        tasks.add(new RectangleTask("108.85,34.20;108.95,34.30"));
+
+        try {
+            List<Future<Void>> results = executor.invokeAll(tasks);
+            for (Future<Void> f : results) {
+                try {
+                    f.get();
+                } catch (Exception e) {
+                    logger.warning("任务执行: " + e.getMessage());
+                }
+            }
+        } catch (InterruptedException e) {
+            logger.warning("线程池执行中断: " + e.getMessage());
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+    // ----------- 配置日志 -----------
+    private static void configureLogger() {
+        try {
+            Handler fileHandler = new FileHandler("traffic.log", true);
+            fileHandler.setFormatter(new SimpleFormatter());
+            logger.addHandler(fileHandler);
+            logger.setLevel(Level.INFO);
+        } catch (IOException e) {
+            System.err.println("日志文件创建: " + e.getMessage());
+        }
+    }
+
+    // ----------- 抽象任务 -----------
+    static abstract class TrafficTask implements Callable<Void> {
+        protected final String url;
+        protected final Map<String, String> params;
+
+        TrafficTask(String url, Map<String, String> params) {
+            this.url = url;
+            this.params = params;
+        }
+
+        protected String buildQuery() throws UnsupportedEncodingException {
+            StringBuilder sb = new StringBuilder(url).append("?");
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                sb.append(URLEncoder.encode(entry.getKey(), "UTF-8"))
+                  .append("=")
+                  .append(URLEncoder.encode(entry.getValue(), "UTF-8"))
+                  .append("&");
+            }
+            return sb.toString();
+        }
+
+        protected String fetchData(String requestUrl) throws IOException {
+            HttpURLConnection conn = (HttpURLConnection) new URL(requestUrl).openConnection();
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            conn.setRequestMethod("GET");
+            try (InputStream in = conn.getInputStream()) {
+                return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+        }
+
+        protected void saveData(String prefix, String json) {
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+            Path file = OUTPUT_DIR.resolve(prefix + "_" + timestamp + ".json");
+            try {
+                Files.writeString(file, json, StandardCharsets.UTF_8);
+                logger.info("保存数据成功: " + file);
+            } catch (IOException e) {
+                logger.warning("保存数据: " + e.getMessage());
+            }
+        }
+    }
+
+    // ----------- 道路任务 -----------
+    static class RoadTask extends TrafficTask {
+        private final String roadName;
+        private final String city;
+
+        RoadTask(String roadName, String city) {
+            super(ROAD_URL, new HashMap<>());
+            this.roadName = roadName;
+            this.city = city;
+        }
+
+        @Override
+        public Void call() {
+            try {
+                params.put("key", API_KEY);
+                params.put("name", roadName);
+                params.put("city", city);
+                String reqUrl = buildQuery();
+                logger.info("请求道路态势: " + reqUrl);
+                String resp = fetchData(reqUrl);
+                saveData("road_" + roadName, resp);
+                parseJson(resp);
+            } catch (Exception e) {
+                logger.warning("道路任务: " + roadName + " -> " + e.getMessage());
+            }
+            return null;
+        }
+
+        private void parseJson(String json) {
+            try {
+                JsonNode node = mapper.readTree(json);
+                JsonNode roads = node.path("trafficinfo").path("roads");
+                for (JsonNode r : roads) {
+                    String name = r.path("name").asText();
+                    String status = r.path("status").asText();
+                    String speed = r.path("speed").asText();
+                    logger.info("道路 " + name + " 状态=" + status + " 速度=" + speed);
+                }
+            } catch (Exception e) {
+                logger.warning("解析道路 JSON : " + e.getMessage());
+            }
+        }
+    }
+
+    // ----------- 矩形任务 -----------
+    static class RectangleTask extends TrafficTask {
+        private final String rectangle;
+
+        RectangleTask(String rectangle) {
+            super(RECTANGLE_URL, new HashMap<>());
+            this.rectangle = rectangle;
+        }
+
+        @Override
+        public Void call() {
+            try {
+                params.put("key", API_KEY);
+                params.put("rectangle", rectangle);
+                String reqUrl = buildQuery();
+                logger.info("请求矩形态势: " + reqUrl);
+                String resp = fetchData(reqUrl);
+                saveData("rectangle", resp);
+                parseJson(resp);
+            } catch (Exception e) {
+                logger.warning("矩形任务: " + e.getMessage());
+            }
+            return null;
+        }
+
+        private void parseJson(String json) {
+            try {
+                JsonNode node = mapper.readTree(json);
+                JsonNode roads = node.path("trafficinfo").path("roads");
+                for (JsonNode r : roads) {
+                    String name = r.path("name").asText();
+                    String status = r.path("status").asText();
+                    String speed = r.path("speed").asText();
+                    logger.info("矩形道路 " + name + " 状态=" + status + " 速度=" + speed);
+                }
+            } catch (Exception e) {
+                logger.warning("解析矩形 JSON : " + e.getMessage());
+            }
+        }
+    }
+}
